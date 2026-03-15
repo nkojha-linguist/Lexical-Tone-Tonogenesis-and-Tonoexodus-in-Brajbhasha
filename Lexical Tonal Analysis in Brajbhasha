@@ -1,0 +1,207 @@
+
+# [0] Packages
+suppressPackageStartupMessages({
+  library(readxl); library(dplyr); library(tidyr); library(ggplot2); library(lme4); library(lmerTest); library(emmeans); library(purrr)})
+emm_options(lmerTest.limit = 4000, pbkrtest.limit = 4000) # set globally
+
+# [1]. Load
+data <- read_excel("C:\\Users\\neete\\Desktop\\3rdCollection(Cleaned)\\JOURNAL01\\OUTPUT (TONE-Phonation36).xlsx", sheet = "All")
+
+# [2]. Factor hygiene
+factor_vars <- c("WordType","Pair","Dataset","Gender","AgeGroup","EducationLevel","Locality","LangProf")
+data <- data %>%
+  mutate(Tone = factor(Tone, levels = c("Neutral", "Low")),
+         across(all_of(factor_vars), factor)) %>%
+  droplevels()
+
+# [3]. Imputation helper
+impute_by_group_mean <- function(x, grp) {
+  m <- ave(x, grp, FUN = function(v) mean(v, na.rm = TRUE))
+  ifelse(is.na(x), m, x)}
+
+# Impute mid F0 + Duration
+for(col in c("F0","Duration")){
+  if(col %in% names(data)){
+    data[[col]] <- impute_by_group_mean(data[[col]], interaction(data$Tone, data$Pair, data$Dataset, data$Gender, drop = TRUE))}}
+
+# Contour long for IMPUTATION and later modeling
+p_cols  <- paste0("p", 0:10)
+contour_long <- data %>%
+  pivot_longer(cols = all_of(p_cols), names_to = "Timepoint", values_to = "F0_contour") %>%
+  mutate(Timepoint = as.integer(sub("^p", "", Timepoint)))
+contour_long <- contour_long %>%
+  group_by(Tone, Pair, Dataset, Gender, Timepoint) %>%
+  mutate(F0_contour = ifelse(is.na(F0_contour), mean(F0_contour, na.rm = TRUE), F0_contour)) %>%
+  ungroup() %>%
+  mutate(TimeProp = Timepoint / max(Timepoint, na.rm = TRUE))  # 0..1 scale
+
+
+# [4]. Sanity check
+message("N=", nrow(data), " | Subjects=", n_distinct(data$Subject), " | Pairs=", n_distinct(data$Pair), " | WordType levels: ", paste(levels(data$WordType), collapse=", "))
+
+# [5]. Theme
+theme_set(theme_minimal(base_size = 12))
+
+# [6]. Safe lmer wrapper
+safe_lmer <- function(formula, dat) {
+  m <- try(lmer(formula, data = dat, REML = TRUE), silent = TRUE)
+  if(inherits(m, "try-error")) {
+    message("Model failed, simplifying random effects...")
+    m <- lmer(update(formula, . ~ . - (1|Pair) + (1|Subject)), data = dat, REML = TRUE)}
+  m}
+
+# [6a]. Subsets
+Monosy  <- data %>% filter(WordType == "Monosyllabic") %>% droplevels()
+MonosyF <- Monosy %>% filter(Gender == "FEMALE") %>% droplevels()
+MonosyM <- Monosy %>% filter(Gender == "MALE") %>% droplevels()
+Disy    <- data %>% filter(WordType == "Disyllabic") %>% droplevels()
+
+# [6b]. Generic model runner (for F0/Duration)
+run_base_models <- function(dv, dat_list) {
+  map(dat_list, ~{
+    f <- as.formula(paste(dv, "~ Tone + (1|Subject) + (1|Pair)"))
+    m <- safe_lmer(f, .x)
+    print(summary(m))
+    print(pairs(emmeans(m, ~ Tone)))
+    invisible(m)})}
+
+# [6c]. Moderator analysis
+run_mods <- function(dv, dat, moderators) {
+  mods <- map(moderators, ~{
+    f <- as.formula(paste(dv, "~ Tone *", .x, "+ (1|Subject) + (1|Pair)"))
+    safe_lmer(f, dat)}) %>% set_names(moderators)
+  map(mods, anova)
+  return(mods)}
+
+# [6d]. Contrast-of-contrasts helper (unchanged but used for both DVs)
+compare_contrast_sizes <- function(model, mod_var) {
+  emms <- emmeans(model, as.formula(paste0("~ ", mod_var, " * Tone")))
+  within <- contrast(emmeans(model, as.formula(paste0("~ Tone | ", mod_var))), method = "pairwise")
+  groups <- unique(as.data.frame(emms)[[mod_var]])
+  contrast_list <- combn(groups, 2, simplify = FALSE, FUN = function(g) {
+    v <- rep(0, nrow(as.data.frame(emms)))
+    v[as.data.frame(emms)[[mod_var]] == g[1] & as.data.frame(emms)$Tone == "Neutral"] <-  1
+    v[as.data.frame(emms)[[mod_var]] == g[1] & as.data.frame(emms)$Tone == "Low"]     <- -1
+    v[as.data.frame(emms)[[mod_var]] == g[2] & as.data.frame(emms)$Tone == "Neutral"] <- -1
+    v[as.data.frame(emms)[[mod_var]] == g[2] & as.data.frame(emms)$Tone == "Low"]     <-  1
+    setNames(list(v), paste0(g[1], "_vs_", g[2]))})
+  diffdiff <- contrast(emms, contrast_list)
+  list(emms = emms, within = within, diffdiff = diffdiff)}
+
+# [6e]. Plotting helper
+plot_box <- function(dv, dat, ylab, title) {
+  ggplot(dat, aes(Tone, .data[[dv]], fill = Tone)) +
+    geom_boxplot(alpha = 0.7, outlier.alpha = 0.4) +
+    facet_wrap(~ Subject, ncol = 15) +
+    labs(title = title, y = ylab, x = "") +
+    theme(axis.text.x = element_text(angle = 60, hjust = 1), strip.background = element_rect(fill = "gray90", color = "gray60"), panel.background = element_rect(fill = "grey95", color = NA))}
+
+############
+# RUN MODELS
+############
+# (6.1) F0: base + moderators
+cat("\n===== F0 MODELS =====\n")
+run_base_models("F0", list(MonosyM, MonosyF))
+mods_F0 <- run_mods("F0", Monosy, c("AgeGroup","EducationLevel","Locality","LangProf"))
+plot_box("F0", Monosy, "F0 (Hz)", "Subject-wise Mid-vowel F0 Contrasts by Tone (Monosyllables)")
+# (6.2) Duration: base + moderators
+cat("\n===== Duration MODELS =====\n")
+run_base_models("Duration", list(Monosy))
+mods_D <- run_mods("Duration", Monosy, c("AgeGroup","EducationLevel","Locality","LangProf"))
+plot_box("Duration", Monosy, "Duration (ms)", "Subject-wise Vowel Duration Contrasts by Tone (Monosyllables)")
+# =====================================================
+# (6.3). Extension: Check for Tone Loss (Neutral–Low size)
+# Use F0 models (mods_F0) since tone contrast is in pitch
+mods_to_check <- c("AgeGroup","EducationLevel","Locality","LangProf")
+contrast_results <- list()
+for(mv in mods_to_check) {
+  cat("\n--- Moderator:", mv, "(Monosyllables, F0) ---\n")
+  # Get fitted model object from earlier
+  model_obj <- mods_F0[[mv]]
+  # Run contrast-of-contrasts
+  rr <- compare_contrast_sizes(model_obj, mv)
+  contrast_results[[mv]] <- rr
+  # Print within-category Neutral–Low differences
+  cat("\nWithin-category Neutral - Low contrasts:\n")
+  print(summary(rr$within, infer = TRUE))
+  # Print difference-of-differences (do groups differ?)
+  cat("\nPairwise comparisons of contrasts:\n")
+  print(summary(rr$diffdiff, infer = TRUE))
+  # Quick bar plot of contrast sizes (Neutral - Low) by category
+  pwdf <- as.data.frame(rr$within)
+  if(!(mv %in% colnames(pwdf))) {
+    tmp_emms_df <- as.data.frame(rr$emms)
+    pwdf[[mv]] <- tmp_emms_df[[mv]][seq(1, nrow(tmp_emms_df), by = 2)]  # extract categories
+  }
+  ggplot(pwdf, aes_string(x = mv, y = "estimate")) +
+    geom_col(width = 0.6, fill = "black") +
+    geom_errorbar(aes(ymin = estimate - 1.96*SE, ymax = estimate + 1.96*SE), width = 0.2, size = 1.1, color = "red") +
+    labs(title = paste0("Neutral–Low contrast in F0 by ", mv, " (Monosyllables)"), y = "Neutral - Low (Hz)", x = mv) +
+    theme_minimal() -> p
+  print(p)}
+
+# (6.4) PITCH CONTOUR — Tone × Time (primary), then add moderators one at a time
+# Function to test Tone effect
+test_tone_effect <- function(dataset_name, timepoint_num, data) {
+  data_subset <- filter(data, Dataset == dataset_name, Timepoint == timepoint_num)
+  if (n_distinct(data_subset$Tone) < 2) 
+    return(tibble(Dataset = dataset_name, Timepoint = timepoint_num, p_value = NA, estimate = NA, df = NA, t_value = NA, note = "Insufficient Tone levels"))
+  model <- lmer(F0_contour ~ Tone + (1 | Subject) + (1 | Pair), data = data_subset, REML = TRUE)
+  coefs <- summary(model)$coefficients
+  tone_row <- coefs[grep("ToneLow", rownames(coefs)), , drop = FALSE]
+  if (nrow(tone_row) == 0) 
+    return(tibble(Dataset = dataset_name, Timepoint = timepoint_num, p_value = NA, estimate = NA, df = NA, t_value = NA, note = "Tone coefficient not found"))
+  tibble(Dataset = dataset_name, Timepoint = timepoint_num, p_value = tone_row[,"Pr(>|t|)"], estimate = tone_row[,"Estimate"], df = tone_row[,"df"], t_value = tone_row[,"t value"], note = NA_character_)}
+# Grid of Dataset × Timepoint
+test_grid <- expand.grid(Dataset = unique(contour_long$Dataset), Timepoint = unique(contour_long$Timepoint))
+# Run all models
+pointwise_results <- pmap_dfr(test_grid, ~ test_tone_effect(..1, ..2, contour_long), .progress = TRUE) %>%
+  mutate(significant_uncorrected = p_value < 0.05, p_adjusted = p.adjust(p_value, "BH"), significant_fdr = p_adjusted < 0.05)
+# View the results
+print(pointwise_results, n = 110)
+# Summarize contour_long for plotting
+contour_summary <- contour_long %>%
+  group_by(Dataset, Tone, Timepoint) %>%
+  summarise(mean_F0 = mean(F0_contour, na.rm = TRUE), se_F0   = sd(F0_contour, na.rm = TRUE) / sqrt(n()), .groups = "drop")
+# Merge with summary for plotting
+contour_summary_with_sig <- contour_summary %>%
+  left_join(select(pointwise_results, Dataset, Timepoint, significant_fdr, p_value), by = c("Dataset", "Timepoint"))
+# Plot
+ggplot(contour_summary_with_sig, aes(Timepoint, mean_F0, color = Tone, group = Tone)) +
+  geom_line(size = 1) +
+  geom_ribbon(aes(ymin = mean_F0 - se_F0, ymax = mean_F0 + se_F0, fill = Tone), alpha = 0.15, color = NA) +
+  geom_point(data = . %>% filter(significant_fdr & Tone == "Neutral"), aes(y = mean_F0), shape = 18, size = 3, color = "black", show.legend = FALSE) +
+  facet_wrap(~ Dataset, ncol = 2) +
+  labs(title = "F0 trajectories by Tone with FDR-corrected significance", subtitle = "Black diamonds = significant (FDR < 0.05) Tone difference", x = "Normalized timepoints (0–10)", y = "F0 (Hz)") +
+  theme(legend.position = "right", strip.background = element_rect(fill = "gray90", color = "gray60"))
+# Summary table
+significance_summary <- pointwise_results %>%
+  group_by(Dataset) %>%
+  summarise(n_significant_uncorrected = sum(significant_uncorrected, na.rm = TRUE), n_significant_fdr = sum(significant_fdr, na.rm = TRUE), percent_significant = mean(significant_fdr, na.rm = TRUE) * 100, .groups = "drop")
+print(significance_summary)
+
+# [7]. COARTICULATORY EFFECTS in Disyllables only
+# Helper function for mixed models + emmeans
+run_coart_analysis <- function(dv, data) {
+  form <- as.formula(paste(dv, "~ Tone * TBU_syll * Syllable * Gender + (1|Subject) + (1|Pair)"))
+  mod  <- safe_lmer(form, data)
+  cat("\n===== Results for", dv, "=====\n")
+  print(anova(mod))
+  print(summary(mod))
+  emm <- emmeans(mod, as.formula(paste("~ Tone | TBU_syll * Syllable * Gender")))
+  print(pairs(emm, adjust = "holm"))
+  return(mod)}
+# Run for F0 and Duration
+mod_f0 <- run_coart_analysis("F0", Disy)
+mod_D  <- run_coart_analysis("Duration", Disy)
+# Helper function for boxplots
+plot_coart <- function(dv, ylab, title, data) {
+  ggplot(data, aes(Tone, .data[[dv]], fill = Tone)) +
+    geom_boxplot(alpha = 0.7, outlier.alpha = 0.4) +
+    facet_grid(Gender + TBU_syll ~ Syllable, scales = "free", switch = "y") +
+    labs(title = title, y = ylab, x = "") +
+    theme(legend.position = "right", strip.placement = "outside", axis.text.x = element_text(angle = 0, hjust = 1), strip.background = element_rect(fill = "gray90", color = "gray60"))}
+# Plots
+plot_coart("F0", "F0 (Hz)", "Coarticulatory effects on mid-F0 (Disyllables)", Disy)
+plot_coart("Duration", "Vowel Duration", "Coarticulatory effects on Vowel Duration (Disyllables)", Disy)
+
